@@ -1,0 +1,468 @@
+name: Build Bolinha Pop APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositorio
+        uses: actions/checkout@v4
+
+      - name: Criar projeto Android
+        run: |
+          mkdir -p nt && cd nt
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BolinhaPop"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.bolinha.pop"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.bolinha.pop"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="Bolinha Pop"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".FloatService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating_ball" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/res/mipmap-anydpi
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#1E6BFF" />
+          </shape>
+          EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M54,54m-8,0a8,8 0,1 0,16 0a8,8 0,1 0,-16 0" />
+              <path android:strokeColor="#FFFFFFFF" android:strokeWidth="5" android:pathData="M54,54m-20,0a20,20 0,1 0,40 0a20,20 0,1 0,-40 0" />
+          </vector>
+          EOF
+          mkdir -p app/src/main/java/com/bolinha/pop
+          cat > app/src/main/java/com/bolinha/pop/Store.kt <<'EOF'
+          package com.bolinha.pop
+
+          import android.content.Context
+          import android.graphics.Rect
+
+          class Store(ctx: Context) {
+              private val sp = ctx.applicationContext.getSharedPreferences("pop", Context.MODE_PRIVATE)
+
+              var ballDp: Int
+                  get() = sp.getInt("ball", 56)
+                  set(v) { sp.edit().putInt("ball", v).apply() }
+
+              var ballX: Int
+                  get() = sp.getInt("ballX", -1)
+                  set(v) { sp.edit().putInt("ballX", v).apply() }
+
+              var ballY: Int
+                  get() = sp.getInt("ballY", -1)
+                  set(v) { sp.edit().putInt("ballY", v).apply() }
+
+              fun recents(): List<String> =
+                  (sp.getString("recents", "") ?: "").split(",").filter { it.isNotEmpty() }
+
+              fun pushRecent(pkg: String) {
+                  val l = recents().toMutableList()
+                  l.remove(pkg)
+                  l.add(0, pkg)
+                  sp.edit().putString("recents", l.take(15).joinToString(",")).apply()
+              }
+
+              fun bounds(pkg: String): Rect? {
+                  val s = sp.getString("b_" + pkg, null) ?: return null
+                  val a = s.split(",")
+                  if (a.size != 4) return null
+                  return try {
+                      Rect(a[0].toInt(), a[1].toInt(), a[2].toInt(), a[3].toInt())
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun saveBounds(pkg: String, r: Rect) {
+                  sp.edit().putString("b_" + pkg, r.left.toString() + "," + r.top + "," + r.right + "," + r.bottom).apply()
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/bolinha/pop
+          cat > app/src/main/java/com/bolinha/pop/Ui.kt <<'EOF'
+          package com.bolinha.pop
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          val BLUE = 0xFF1E6BFF.toInt()
+          val BLUE_MID = 0xFF3B8BFF.toInt()
+          val BLUE_LIGHT = 0xFFEAF2FF.toInt()
+          val STROKE = 0xFFD6E4FF.toInt()
+          val INK = 0xFF0F1B33.toInt()
+          val SOFT = 0xFF5B6B8A.toInt()
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+          fun Context.screen(): Pair<Int, Int> {
+              val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              return if (Build.VERSION.SDK_INT >= 30) {
+                  val b = wm.maximumWindowMetrics.bounds
+                  b.width() to b.height()
+              } else {
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  dm.widthPixels to dm.heightPixels
+              }
+          }
+
+          fun Context.shape(color: Int, radiusDp: Int, strokeColor: Int = 0, strokeDp: Int = 0): GradientDrawable {
+              val g = GradientDrawable()
+              g.setColor(color)
+              g.cornerRadius = dp(radiusDp).toFloat()
+              if (strokeDp > 0) g.setStroke(dp(strokeDp), strokeColor)
+              return g
+          }
+
+          fun Context.styleBtn(tv: TextView, primary: Boolean) {
+              if (primary) {
+                  val g = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(BLUE_MID, BLUE))
+                  g.cornerRadius = dp(16).toFloat()
+                  tv.background = g
+                  tv.setTextColor(Color.WHITE)
+              } else {
+                  tv.background = shape(BLUE_LIGHT, 16)
+                  tv.setTextColor(BLUE)
+              }
+          }
+
+          @SuppressLint("ClickableViewAccessibility")
+          fun Context.button(label: String, primary: Boolean, onClick: () -> Unit): TextView {
+              val tv = TextView(this)
+              tv.text = label
+              tv.gravity = Gravity.CENTER
+              tv.textSize = 13f
+              tv.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+              tv.minHeight = dp(44)
+              tv.setPadding(dp(8), dp(8), dp(8), dp(8))
+              styleBtn(tv, primary)
+              tv.setOnClickListener { onClick() }
+              tv.setOnTouchListener { v, e ->
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.95f).scaleY(0.95f).setDuration(90).start()
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                          v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                  }
+                  false
+              }
+              return tv
+          }
+
+          fun Context.rowOf(vararg views: View): LinearLayout {
+              val row = LinearLayout(this)
+              row.orientation = LinearLayout.HORIZONTAL
+              row.setPadding(0, dp(3), 0, dp(3))
+              for (v in views) {
+                  val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  lp.setMargins(dp(3), 0, dp(3), 0)
+                  row.addView(v, lp)
+              }
+              return row
+          }
+
+          fun Context.card(): LinearLayout {
+              val c = LinearLayout(this)
+              c.orientation = LinearLayout.VERTICAL
+              c.setPadding(dp(16), dp(16), dp(16), dp(16))
+              c.background = shape(Color.WHITE, 20, STROKE, 1)
+              return c
+          }
+
+          class BallView(ctx: Context) : View(ctx) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat()
+                  val r = w / 2f
+                  p.style = Paint.Style.FILL
+                  p.shader = LinearGradient(0f, 0f, w, w, 0xFF5AA0FF.toInt(), 0xFF1450E0.toInt(), Shader.TileMode.CLAMP)
+                  c.drawCircle(r, r, r, p)
+                  p.shader = null
+                  p.color = Color.WHITE
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = w * 0.07f
+                  c.drawCircle(r, r, r * 0.42f, p)
+                  p.style = Paint.Style.FILL
+                  c.drawCircle(r, r, r * 0.14f, p)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/bolinha/pop
+          cat > app/src/main/java/com/bolinha/pop/MainActivity.kt <<'EOF'
+          package com.bolinha.pop
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.content.res.ColorStateList
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var store: Store
+              private lateinit var statusOverlay: TextView
+              private lateinit var statusFree: TextView
+              private lateinit var mainBtn: TextView
+
+              private fun text(s: String, size: Float, color: Int, bold: Boolean = false): TextView {
+                  val t = TextView(this)
+                  t.text = s
+                  t.textSize = size
+                  t.setTextColor(color)
+                  if (bold) t.typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                  return t
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  store = Store(this)
+                  window.statusBarColor = Color.WHITE
+                  window.navigationBarColor = Color.WHITE
+                  window.decorView.systemUiVisibility = 0x2000 or 0x10
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  }
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(20), dp(24), dp(20), dp(24))
+
+                  root.addView(text("Bolinha Pop", 30f, INK, true))
+                  val sub = text("Abra qualquer app em uma janela flutuante", 14f, SOFT)
+                  sub.setPadding(0, dp(2), 0, dp(16))
+                  root.addView(sub)
+
+                  // status
+                  val c1 = card()
+                  c1.addView(text("Status", 16f, INK, true))
+                  statusOverlay = text("", 14f, SOFT)
+                  statusOverlay.setPadding(0, dp(8), 0, 0)
+                  statusFree = text("", 14f, SOFT)
+                  statusFree.setPadding(0, dp(4), 0, 0)
+                  c1.addView(statusOverlay)
+                  c1.addView(statusFree)
+                  root.addView(c1, cardLp())
+
+                  // botão principal
+                  mainBtn = button("Iniciar bolinha", true) { onMain() }
+                  mainBtn.textSize = 18f
+                  mainBtn.minHeight = dp(60)
+                  val lpBtn = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lpBtn.topMargin = dp(14)
+                  root.addView(mainBtn, lpBtn)
+
+                  // tamanho da bolinha
+                  val c2 = card()
+                  c2.addView(text("Tamanho da bolinha", 16f, INK, true))
+                  val sizeLabel = text(store.ballDp.toString() + " dp", 14f, BLUE)
+                  sizeLabel.setPadding(0, dp(4), 0, 0)
+                  c2.addView(sizeLabel)
+                  val seek = SeekBar(this)
+                  seek.max = 60
+                  seek.progress = (store.ballDp - 40).coerceIn(0, 60)
+                  seek.progressTintList = ColorStateList.valueOf(BLUE)
+                  seek.thumbTintList = ColorStateList.valueOf(BLUE)
+                  seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          sizeLabel.text = (p + 40).toString() + " dp"
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {
+                          store.ballDp = (s?.progress ?: 16) + 40
+                          if (FloatService.running) {
+                              startService(Intent(this@MainActivity, FloatService::class.java).setAction("reload"))
+                          }
+                      }
+                  })
+                  c2.addView(seek)
+                  root.addView(c2, cardLp())
+
+                  // janelas livres
+                  val c3 = card()
+                  c3.addView(text("Janelas livres (obrigatório)", 16f, INK, true))
+                  val how = text(
+                      "O Android só abre apps em janelinha se as janelas de forma livre estiverem ligadas:\n\n" +
+                          "1. Ative as Opções do desenvolvedor (Sobre o telefone, toque 7 vezes em Número da versão).\n" +
+                          "2. Ligue \"Ativar janelas de forma livre\" e \"Forçar atividades a serem redimensionáveis\".\n" +
+                          "3. Reinicie o celular.",
+                      14f, SOFT
+                  )
+                  how.setPadding(0, dp(8), 0, dp(12))
+                  c3.addView(how)
+                  c3.addView(button("Abrir opções do desenvolvedor", false) {
+                      try {
+                          startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "Abra Configurações e procure por Opções do desenvolvedor.", Toast.LENGTH_LONG).show()
+                      }
+                  })
+                  root.addView(c3, cardLp())
+
+                  // como usar
+                  val c4 = card()
+                  c4.addView(text("Como usar", 16f, INK, true))
+                  val use = text(
+                      "Toque na bolinha para abrir o painel e escolha um app em Apps recentes ou Todos os apps. " +
+                          "Arraste a bolinha para mover. Use Menor, Maior e as setas para ajustar a janela. " +
+                          "Tirar da tela esconde a janela; para voltar, toque na bolinha, em Apps recentes e no app. " +
+                          "O tamanho e a posição de cada app ficam salvos.\n\n" +
+                          "Limitação: o Android só permite isso em aparelhos que aceitam janelas livres, e alguns fabricantes limitam o ajuste de janelas de outros apps.",
+                      14f, SOFT
+                  )
+                  use.setPadding(0, dp(8), 0, 0)
+                  c4.addView(use)
+                  root.addView(c4, cardLp())
+
+                  val sv = ScrollView(this)
+                  sv.isVerticalScrollBarEnabled = false
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun cardLp(): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(14)
+                  return lp
+              }
+
+              private fun onMain() {
+                  if (!Settings.canDrawOverlays(this)) {
+                
