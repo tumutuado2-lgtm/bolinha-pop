@@ -313,7 +313,7 @@ jobs:
               }
           }
           EOF
-          mkdir -p app/src/main/java/com/bolinha/pop
+                    mkdir -p app/src/main/java/com/bolinha/pop
           cat > app/src/main/java/com/bolinha/pop/MainActivity.kt <<'EOF'
           package com.bolinha.pop
 
@@ -465,4 +465,386 @@ jobs:
 
               private fun onMain() {
                   if (!Settings.canDrawOverlays(this)) {
-                
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                      return
+                  }
+                  if (FloatService.running) {
+                      stopService(Intent(this, FloatService::class.java))
+                  } else {
+                      startForegroundService(Intent(this, FloatService::class.java))
+                  }
+                  window.decorView.postDelayed({ refresh() }, 400)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ov = Settings.canDrawOverlays(this)
+                  statusOverlay.text = "Sobreposição de tela: " + (if (ov) "permitida" else "necessária")
+                  val free = Settings.Global.getInt(contentResolver, "enable_freeform_support", 0) == 1 ||
+                      packageManager.hasSystemFeature("android.software.freeform_window_management")
+                  statusFree.text = "Janelas livres: " + (if (free) "ativadas" else "não ativadas")
+                  mainBtn.text = if (!ov) "Permitir sobreposição" else if (FloatService.running) "Parar bolinha" else "Iniciar bolinha"
+              }
+          }
+          EOF
+                    mkdir -p app/src/main/java/com/bolinha/pop
+          cat > app/src/main/java/com/bolinha/pop/FloatService.kt <<'EOF'
+          package com.bolinha.pop
+
+          import android.app.ActivityOptions
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.graphics.Typeface
+          import android.graphics.drawable.Drawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+
+          class FloatService : Service() {
+
+              companion object {
+                  @Volatile
+                  var running = false
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var store: Store
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var ball: BallView? = null
+              private var ballLp: WindowManager.LayoutParams? = null
+              private var panel: View? = null
+              private var listBox: LinearLayout? = null
+              private var curLabel: TextView? = null
+              private var tabR: TextView? = null
+              private var tabA: TextView? = null
+
+              private var curPkg: String? = null
+              private var curName: String = ""
+              private var allApps: List<Triple<String, CharSequence, Drawable>>? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  store = Store(this)
+                  startFg()
+                  if (!Settings.canDrawOverlays(this)) {
+                      stopSelf()
+                      return
+                  }
+                  showBall()
+                  running = true
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "reload") applyBallSize()
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  closePanel()
+                  ball?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  ball = null
+                  running = false
+                  super.onDestroy()
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("pop", "Bolinha Pop", NotificationManager.IMPORTANCE_MIN))
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "pop")
+                      .setContentTitle("Bolinha Pop ativa")
+                      .setContentText("Toque para abrir o app")
+                      .setSmallIcon(android.R.drawable.ic_menu_more)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+              // ------------------------------------------------------------ bolinha
+
+              private fun showBall() {
+                  val size = dp(store.ballDp)
+                  val (sw, sh) = screen()
+                  val v = BallView(this)
+                  v.alpha = 0.95f
+                  val lp = WindowManager.LayoutParams(
+                      size, size,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = if (store.ballX >= 0) store.ballX else sw - size - dp(8)
+                  lp.y = if (store.ballY >= 0) store.ballY else sh / 3
+
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  v.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX; downY = e.rawY
+                              startX = lp.x; startY = lp.y
+                              moved = false
+                              v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(80).start()
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (abs(dx) > dp(6) || abs(dy) > dp(6)) moved = true
+                              if (moved) {
+                                  lp.x = (startX + dx).toInt().coerceIn(0, sw - lp.width)
+                                  lp.y = (startY + dy).toInt().coerceIn(0, sh - lp.height)
+                                  try { wm.updateViewLayout(v, lp) } catch (ex: Exception) {}
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                              if (moved) {
+                                  store.ballX = lp.x
+                                  store.ballY = lp.y
+                              } else if (panel != null) {
+                                  closePanel()
+                              } else {
+                                  openPanel()
+                              }
+                          }
+                          MotionEvent.ACTION_CANCEL -> v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                      }
+                      true
+                  }
+                  try {
+                      wm.addView(v, lp)
+                  } catch (e: Exception) {
+                      toast("Não foi possível mostrar a bolinha.")
+                      stopSelf()
+                      return
+                  }
+                  ball = v
+                  ballLp = lp
+              }
+
+              private fun applyBallSize() {
+                  val v = ball ?: return
+                  val lp = ballLp ?: return
+                  val size = dp(store.ballDp)
+                  lp.width = size
+                  lp.height = size
+                  try { wm.updateViewLayout(v, lp) } catch (e: Exception) {}
+              }
+
+              // ------------------------------------------------------------ painel
+
+              private fun openPanel() {
+                  if (panel != null) return
+                  val (sw, sh) = screen()
+                  val pw = minOf(dp(320), sw - dp(24))
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(14), dp(14), dp(14), dp(14))
+                  root.background = shape(Color.WHITE, 22, STROKE, 1)
+
+                  val head = LinearLayout(this)
+                  head.orientation = LinearLayout.HORIZONTAL
+                  head.gravity = Gravity.CENTER_VERTICAL
+                  val title = TextView(this)
+                  title.text = "Bolinha Pop"
+                  title.textSize = 18f
+                  title.setTextColor(INK)
+                  title.typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                  head.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  head.addView(button("Fechar", false) { closePanel() })
+                  root.addView(head)
+
+                  val tr = button("Apps recentes", true) { showRecents() }
+                  val ta = button("Todos os apps", false) { showAll() }
+                  tabR = tr
+                  tabA = ta
+                  val tabs = rowOf(tr, ta)
+                  tabs.setPadding(0, dp(10), 0, dp(6))
+                  root.addView(tabs)
+
+                  val scroll = ScrollView(this)
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  scroll.addView(box)
+                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, minOf(dp(230), (sh * 0.32f).toInt())))
+                  listBox = box
+
+                  val cl = TextView(this)
+                  cl.textSize = 13f
+                  cl.setTextColor(SOFT)
+                  cl.setPadding(0, dp(10), 0, dp(6))
+                  curLabel = cl
+                  updateCurLabel()
+                  root.addView(cl)
+
+                  root.addView(rowOf(
+                      button("Menor", false) { resize(0.85f) },
+                      button("Maior", false) { resize(1.18f) },
+                      button("Tirar da tela", false) { hideWin() }
+                  ))
+                  root.addView(rowOf(
+                      button("Esquerda", false) { move(-1f, 0f) },
+                      button("Direita", false) { move(1f, 0f) },
+                      button("Cima", false) { move(0f, -1f) },
+                      button("Baixo", false) { move(0f, 1f) }
+                  ))
+                  root.addView(rowOf(button("Encerrar bolinha", true) { stopSelf() }))
+
+                  root.measure(
+                      View.MeasureSpec.makeMeasureSpec(pw, View.MeasureSpec.EXACTLY),
+                      View.MeasureSpec.makeMeasureSpec(sh, View.MeasureSpec.AT_MOST)
+                  )
+                  val ph = root.measuredHeight
+                  val bl = ballLp
+                  val bs = bl?.width ?: dp(56)
+                  val bx = bl?.x ?: 0
+                  val by = bl?.y ?: 0
+
+                  val lp = WindowManager.LayoutParams(
+                      pw, ViewGroup.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = (bx + bs / 2 - pw / 2).coerceIn(dp(8), maxOf(dp(8), sw - pw - dp(8)))
+                  lp.y = if (by + bs + ph + dp(8) < sh) by + bs + dp(8) else maxOf(dp(8), by - ph - dp(8))
+
+                  try {
+                      wm.addView(root, lp)
+                      panel = root
+                  } catch (e: Exception) {
+                      toast("Não foi possível abrir o painel.")
+                      return
+                  }
+                  showRecents()
+              }
+
+              private fun closePanel() {
+                  panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  panel = null
+                  listBox = null
+                  curLabel = null
+                  tabR = null
+                  tabA = null
+              }
+
+              private fun updateCurLabel() {
+                  curLabel?.text = if (curPkg == null) "Nenhuma janela aberta ainda" else "Janela atual: " + curName
+              }
+
+              private fun showRecents() {
+                  val box = listBox ?: return
+                  tabR?.let { styleBtn(it, true) }
+                  tabA?.let { styleBtn(it, false) }
+                  box.removeAllViews()
+                  var count = 0
+                  for (pkg in store.recents()) {
+                      val info = try { packageManager.getApplicationInfo(pkg, 0) } catch (e: Exception) { continue }
+                      addRow(box, pkg, packageManager.getApplicationLabel(info), packageManager.getApplicationIcon(info))
+                      count++
+                  }
+                  if (count == 0) box.addView(note("Nada por aqui ainda. Abra um app em Todos os apps."))
+              }
+
+              private fun showAll() {
+                  val box = listBox ?: return
+                  tabR?.let { styleBtn(it, false) }
+                  tabA?.let { styleBtn(it, true) }
+                  box.removeAllViews()
+                  val cached = allApps
+                  if (cached != null) {
+                      for (a in cached) addRow(box, a.first, a.second, a.third)
+                      return
+                  }
+                  box.addView(note("Carregando apps..."))
+                  Thread {
+                      val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val pm = packageManager
+                      val list = pm.queryIntentActivities(i, 0)
+                          .map { Triple(it.activityInfo.packageName, it.loadLabel(pm), it.loadIcon(pm)) }
+                          .filter { it.first != packageName }
+                          .distinctBy { it.first }
+                          .sortedBy { it.second.toString().lowercase() }
+                      handler.post {
+                          allApps = list
+                          val b = listBox
+                          if (b != null && tabA != null) {
+                              b.removeAllViews()
+                              for (a in list) addRow(b, a.first, a.second, a.third)
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun note(s: String): TextView {
+                  val t = TextView(this)
+                  t.text = s
+                  t.textSize = 14f
+                  t.setTextColor(SOFT)
+                  t.setPadding(dp(4), dp(10), dp(4), dp(10))
+                  return t
+              }
+
+              private fun addRow(box: LinearLayout, pkg: String, label: CharSequence, icon: Drawable) {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  row.setPadding(dp(6), dp(8), dp(6), dp(8))
+                  val iv = ImageView(this)
+                  iv.setImageDrawable(icon)
+                  row.addView(iv, LinearLayout.LayoutParams(dp(36), dp(36)))
+                  val t = TextView(this)
+                  t.text = label
+                  t.textSize = 15f
+                  t.setTextColor(INK)
+                  val tlp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  tlp.marginStart = dp(12)
+                  row.addView(t, tlp)
+                  row.setOnClickListener { openApp(pkg, label.toString()) }
+                  box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+              }
+
+          EOF
+          
