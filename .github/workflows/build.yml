@@ -847,4 +847,121 @@ jobs:
               }
 
           EOF
-          
+                    cat >> app/src/main/java/com/bolinha/pop/FloatService.kt <<'EOF'
+              // ------------------------------------------------------------ janelas
+
+              private fun defaultRect(): Rect {
+                  val (w, h) = screen()
+                  val rw = (w * 0.8f).toInt()
+                  val rh = (h * 0.55f).toInt()
+                  val l = (w - rw) / 2
+                  val t = (h - rh) / 2
+                  return Rect(l, t, l + rw, t + rh)
+              }
+
+              private fun launch(pkg: String, r: Rect): Boolean {
+                  val intent = packageManager.getLaunchIntentForPackage(pkg)
+                  if (intent == null) {
+                      toast("Este app não pode ser aberto.")
+                      return false
+                  }
+                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  val opts = ActivityOptions.makeBasic()
+                  opts.setLaunchBounds(r)
+                  try {
+                      ActivityOptions::class.java
+                          .getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                          .invoke(opts, 5)
+                  } catch (t: Throwable) {
+                  }
+                  return try {
+                      startActivity(intent, opts.toBundle())
+                      true
+                  } catch (e: Exception) {
+                      toast("Não foi possível abrir: " + e.message)
+                      false
+                  }
+              }
+
+              private fun openApp(pkg: String, label: String) {
+                  val r = store.bounds(pkg) ?: defaultRect()
+                  if (launch(pkg, r)) {
+                      store.saveBounds(pkg, r)
+                      store.pushRecent(pkg)
+                      curPkg = pkg
+                      curName = label
+                      closePanel()
+                  }
+              }
+
+              private fun resize(f: Float) {
+                  val p = curPkg
+                  if (p == null) {
+                      toast("Abra um app primeiro.")
+                      return
+                  }
+                  val b = store.bounds(p) ?: defaultRect()
+                  val (sw, sh) = screen()
+                  val nw = (b.width() * f).toInt().coerceIn(minOf(dp(200), sw), sw)
+                  val nh = (b.height() * f).toInt().coerceIn(minOf(dp(200), sh), sh)
+                  val l = (b.centerX() - nw / 2).coerceIn(0, sw - nw)
+                  val t = (b.centerY() - nh / 2).coerceIn(0, sh - nh)
+                  val r = Rect(l, t, l + nw, t + nh)
+                  store.saveBounds(p, r)
+                  launch(p, r)
+              }
+
+              private fun move(dx: Float, dy: Float) {
+                  val p = curPkg
+                  if (p == null) {
+                      toast("Abra um app primeiro.")
+                      return
+                  }
+                  val b = store.bounds(p) ?: defaultRect()
+                  val (sw, sh) = screen()
+                  val w = b.width()
+                  val h = b.height()
+                  val l = (b.left + (dx * sw * 0.1f).toInt()).coerceIn(0, maxOf(0, sw - w))
+                  val t = (b.top + (dy * sh * 0.1f).toInt()).coerceIn(0, maxOf(0, sh - h))
+                  val r = Rect(l, t, l + w, t + h)
+                  store.saveBounds(p, r)
+                  launch(p, r)
+              }
+
+              private fun hideWin() {
+                  val p = curPkg
+                  if (p == null) {
+                      toast("Abra um app primeiro.")
+                      return
+                  }
+                  val b = store.bounds(p) ?: defaultRect()
+                  val (sw, _) = screen()
+                  launch(p, Rect(sw, b.top, sw + b.width(), b.bottom))
+              }
+          }
+          EOF
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        working-directory: nt
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Preparar APK
+        run: cp nt/app/build/outputs/apk/debug/app-debug.apk Bolinha-Pop.apk
+
+      - name: Publicar na aba Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" Bolinha-Pop.apk --title "Bolinha Pop $TAG" --notes "APK instalavel do Bolinha Pop."
